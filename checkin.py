@@ -47,8 +47,8 @@ def get_token(session: str) -> str:
     headers = {
         "Cookie": "X-Cloudide-Session=" + session,
         "Referer": "https://www.trae.cn/",
-        "Origin": "https://www.trae.cn",
-        "User-Agent": "TraeCheckin/1.0",
+        "Origin": "https://www.trae.cn",        
+"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "application/json, text/plain, */*",
     }
     status, text = _post("/cloudide/api/v3/common/GetUserToken", headers)
