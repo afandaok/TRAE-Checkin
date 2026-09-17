@@ -71,7 +71,7 @@ def checkin(token: str, device_id: str) -> dict:
         "X-User-Region": "cn",
         "x-device-id": device_id,
         "Content-Type": "application/json",
-        "User-Agent": "TraeCheckin/1.0",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) TRAESOLOCN/1.107.1 Chrome/142.0.7444.235 Electron/39.2.7 Safari/537.36"
     }
     status, text = _post("/trae/api/v2/ug/checkin_credits/claim", headers, "{}")
     try:
