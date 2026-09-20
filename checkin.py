@@ -34,16 +34,21 @@ Trae 每日签到脚本（GitHub Actions 版 · 对齐 traework 客户端请求�
 
 依赖：仅标准库。
 
-环境变量：
-  TRAE_SESSION        账号 1 的 X-Cloudide-Session Cookie（必填）
-  TRAE_DEVICE_ID      账号 1 的 x-device-id（选填，缺省按 session 派生 14 位）
-  TRAE_SESSION_N      第 N(N>=2) 个账号会话 Cookie；缺失即停止
-  TRAE_DEVICE_ID_N    第 N 个账号的 x-device-id（选填）
-  TRAE_MARKET_USER_ID 全局 x-market-user-id（选填，缺省按 session 派生）
-  TRAE_VSCODE_SESSIONID 全局 vscode-sessionid（选填，缺省按 session 派生）
-  FEISHU_WEBHOOK      飞书机器人 webhook（选填，汇总推送）
-  CHECKIN_JITTER_MAX  启动随机抖动上限（秒，默认 0 即关闭；设为>0启用）。
-                      注：已排除整点洪峰假设，故默认关闭，仅作为可选去同步手段。
+环境变量（★ = 关键，必须配成 traework 抓包得到的真实值，缺失会派生假值并必然 9074）：
+★ TRAE_DEVICE_ID        账号 1 的 x-device-id，如 45535852009417
+★ TRAE_MARKET_USER_ID   账号 1 的 x-market-user-id，如 a15e2e30-80e5-43c5-8aa1-96bba5951415
+★ TRAE_VSCODE_SESSIONID 账号 1 的 vscode-sessionid，64 位 hex
+  TRAE_SESSION          账号 1 的 X-Cloudide-Session Cookie（必填）
+  TRAE_DEVICE_BRAND     设备型号（选填，默认 90W2000WCP）
+  TRAE_OS_VERSION       系统版本（选填，默认 Windows 11 Home China）
+  TRAE_SESSION_N        第 N(N>=2) 个账号会话 Cookie；缺失即停止
+  TRAE_DEVICE_ID_N / TRAE_MARKET_USER_ID_N / TRAE_VSCODE_SESSIONID_N
+                        第 N 个账号对应的身份参数（多账号时每个都要各自抓包）
+  TRAE_X_HELIOS / TRAE_X_MEDUSA
+                        可选：抓包得到的动态签名，用于排查是否为必需项（可能过期）
+  FEISHU_WEBHOOK        飞书机器人 webhook（选填，汇总推送）
+  CHECKIN_JITTER_MAX    启动随机抖动上限（秒，默认 0 即关闭；设为>0启用）。
+                        注：已排除整点洪峰假设，故默认关闭，仅作为可选去同步手段。
 """
 
 import datetime
@@ -97,7 +102,7 @@ def _post(path, headers, body=""):
 
 def build_client_headers(token, identity):
     """构造与 traework 客户端一致的请求头。identity 含稳定指纹字段。"""
-    return {
+    headers = {
         "host": "api.trae.cn",
         "accept-encoding": "gzip, deflate, br, zstd",
         "accept-language": "zh-CN",
@@ -116,7 +121,7 @@ def build_client_headers(token, identity):
         "x-device-id": identity["device_id"],
         "x-device-type": "windows",
         "x-lgw-req-sdk-type": "3",
-        "x-os-version": "Windows 11 Home China",
+        "x-os-version": identity.get("os_version") or "Windows 11 Home China",
         "package-type": "stable_cn",
         "x-request-id": str(uuid.uuid4()),
         "x-lscbd-aid": LSCBD_AID,
@@ -125,8 +130,13 @@ def build_client_headers(token, identity):
         "accept": "*/*",
         "x-tt-trace-id": "00-" + derive_hex(identity["device_id"], "trace", 32) + "-01",
         "x-neptune": NEPTUNE,
-        # 注意：x-helios / x-medusa 为客户端反欺诈 SDK 动态签名，无法伪造，此处略去。
     }
+    # 可选：若配置了抓包得到的动态签名则带上（用于排查签名是否为必需项）
+    if identity.get("helios"):
+        headers["x-helios"] = identity["helios"]
+    if identity.get("medusa"):
+        headers["x-medusa"] = identity["medusa"]
+    return headers
 
 
 def get_token(session: str) -> str:
@@ -175,7 +185,13 @@ def do_claim(token, identity) -> dict:
 
 
 # 命中这些文案/状态码时按「稍后重试」处理
-RETRY_KEYWORDS = ["当前参与用户太多", "请稍后再试", "too many", "try again", "频繁"]
+RETRY_KEYWORDS = ["too many", "try again", "频繁", "稍后再试"]
+
+# 确定性拦截码：重试无意义，应立刻失败，避免白白等待数分钟。
+# 9074 实测结论：HTTP 200 + {"code":9074,"message":"当前参与用户太多，请稍后再试"}，
+# 连续 5 次指数退避重试返回完全相同；非整点定时、非整点手动执行同样必然触发。
+# 即：与时间和并发无关，是请求本身未通过服务端校验。文案「参与用户太多」是障眼法。
+NO_RETRY_CODES = {9074}
 
 
 def is_retryable(result) -> bool:
@@ -185,6 +201,8 @@ def is_retryable(result) -> bool:
         return False
     msg = str((body or {}).get("message", "")).lower()
     code = (body or {}).get("code", 0)
+    if code in NO_RETRY_CODES:
+        return False
     if http in (429, 500, 502, 503, 504):
         return True
     if code != 0 and any(k in msg for k in RETRY_KEYWORDS):
@@ -262,21 +280,57 @@ def iter_sessions():
         n += 1
 
 
+def _acct_env(index, base):
+    """读取账号级环境变量：账号1 读 BASE，账号N 优先读 BASE_N。"""
+    if index <= 1:
+        return os.environ.get(base, "").strip()
+    return os.environ.get("%s_%d" % (base, index), "").strip()
+
+
 def build_identity(index, session, device_id_override):
-    """构造账号的稳定指纹；device_id 缺省时按 session 派生。"""
-    device_id = device_id_override or derive_device_id(session)
-    market_user_id = (os.environ.get("TRAE_MARKET_USER_ID", "").strip()
+    """构造账号身份。
+
+    重大结论：服务端是靠 x-market-user-id / x-device-id 这套「客户端设备身份」认账号的，
+    JWT 并非关键（实测用打码的假 token 也能签到成功）。因此这里**绝不能**再派生假身份——
+    派生的假 market-user-id / device_id 与真实账号不匹配，必然触发 code=9074。
+
+    正确做法：用 reqable 抓取 traework 真实请求，把这三个值配到环境变量里。
+    缺失时仍会派生，但会明确告警——派生值基本等于必然失败。
+    """
+    derived = []
+
+    device_id = (_acct_env(index, "TRAE_DEVICE_ID") or device_id_override
+                 or derive_device_id(session))
+    if not (_acct_env(index, "TRAE_DEVICE_ID") or device_id_override):
+        derived.append("TRAE_DEVICE_ID")
+
+    market_user_id = (_acct_env(index, "TRAE_MARKET_USER_ID")
                       or derive_uuid(session, "market"))
-    vscode_sessionid = (os.environ.get("TRAE_VSCODE_SESSIONID", "").strip()
+    if not _acct_env(index, "TRAE_MARKET_USER_ID"):
+        derived.append("TRAE_MARKET_USER_ID")
+
+    vscode_sessionid = (_acct_env(index, "TRAE_VSCODE_SESSIONID")
                         or derive_hex(session, "vscode", 64))
-    # 设备品牌随 device_id 派生一个稳定的型号字符串
-    brands = ["90W2000WCP", "PFM920", "LENOVO82A2", "HPAB1", "DELL0A1B"]
-    device_brand = brands[int(hashlib.sha1(device_id.encode()).hexdigest(), 16) % len(brands)]
+    if not _acct_env(index, "TRAE_VSCODE_SESSIONID"):
+        derived.append("TRAE_VSCODE_SESSIONID")
+
+    device_brand = _acct_env(index, "TRAE_DEVICE_BRAND") or "90W2000WCP"
+    os_version = _acct_env(index, "TRAE_OS_VERSION") or "Windows 11 Home China"
+
+    if derived:
+        print("[警告] 以下身份参数缺失，已使用派生假值，几乎必然触发 code=9074：%s"
+              % "、".join(derived))
+        print("[警告] 请用 reqable 抓取 traework 真实请求并配置这些环境变量。")
+
     return {
         "device_id": device_id,
         "market_user_id": market_user_id,
         "vscode_sessionid": vscode_sessionid,
         "device_brand": device_brand,
+        "os_version": os_version,
+        # 可选：动态反欺诈签名（回放自己抓包的值，可能过期，仅用于排查）
+        "helios": _acct_env(index, "TRAE_X_HELIOS"),
+        "medusa": _acct_env(index, "TRAE_X_MEDUSA"),
     }
 
 
@@ -335,6 +389,10 @@ def main():
                 print("[%s] 签到失败：code=%s message=%s" % (name, code, msg))
                 print("[%s]   原始响应: HTTP %s %s"
                       % (name, result["http"], json.dumps(body, ensure_ascii=False)[:300]))
+                if code == 9074:
+                    print("[%s]   说明：9074 是确定性校验拦截，不是限流，重试无效。" % name)
+                    print("[%s]   已对齐全部静态指纹后仍触发，剩余差异只剩 x-helios/x-medusa" % name)
+                    print("[%s]   两个动态反欺诈签名 —— 纯 HTTP 复现路线到此为止。" % name)
                 fail_names.append(name)
                 all_ok = False
         except Exception as e:
