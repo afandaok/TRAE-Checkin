@@ -2,7 +2,11 @@ name: Trae Daily Checkin
 
 on:
   schedule:
-    # 北京时间每天 08:00（UTC 00:00）
+    # UTC 17-23 与 0-2 点的第 6 分钟，共 10 次/天。
+    # 换算北京时间（UTC+8）：01:06 02:06 03:06 04:06 05:06 06:06 07:06 08:06 09:06 10:06
+    # 设计意图：签到额度约在北京时间 0 点重置，01:06 首次尝试；
+    # 其后 9 次为失败兜底（已签到时脚本会走短路分支直接跳过，几乎不耗时）。
+    # 若想省 Actions 时长，可改成 - cron: "6 17 * * *"（仅北京时间 01:06 一次）。
     - cron: "6 17-23,0-2 * * *"
   workflow_dispatch: {}
 
@@ -23,13 +27,35 @@ jobs:
 
       - name: Run checkin
         env:
+          # ---- 账号 1 ----
           TRAE_SESSION: ${{ secrets.TRAE_SESSION }}
           TRAE_DEVICE_ID: ${{ secrets.TRAE_DEVICE_ID }}
+          TRAE_MARKET_USER_ID: ${{ secrets.TRAE_MARKET_USER_ID }}
+          TRAE_VSCODE_SESSIONID: ${{ secrets.TRAE_VSCODE_SESSIONID }}
+
+          # ---- 账号 2 ----
           TRAE_SESSION_2: ${{ secrets.TRAE_SESSION_2 }}
           TRAE_DEVICE_ID_2: ${{ secrets.TRAE_DEVICE_ID_2 }}
+          TRAE_MARKET_USER_ID_2: ${{ secrets.TRAE_MARKET_USER_ID_2 }}
+          TRAE_VSCODE_SESSIONID_2: ${{ secrets.TRAE_VSCODE_SESSIONID_2 }}
+
+          # ---- 账号 3 ----
           TRAE_SESSION_3: ${{ secrets.TRAE_SESSION_3 }}
           TRAE_DEVICE_ID_3: ${{ secrets.TRAE_DEVICE_ID_3 }}
+          TRAE_MARKET_USER_ID_3: ${{ secrets.TRAE_MARKET_USER_ID_3 }}
+          TRAE_VSCODE_SESSIONID_3: ${{ secrets.TRAE_VSCODE_SESSIONID_3 }}
+
+          # ---- 账号 4 ----
           TRAE_SESSION_4: ${{ secrets.TRAE_SESSION_4 }}
           TRAE_DEVICE_ID_4: ${{ secrets.TRAE_DEVICE_ID_4 }}
+          TRAE_MARKET_USER_ID_4: ${{ secrets.TRAE_MARKET_USER_ID_4 }}
+          TRAE_VSCODE_SESSIONID_4: ${{ secrets.TRAE_VSCODE_SESSIONID_4 }}
+
+          # ---- 可选：动态反欺诈签名 ----
+          # 仅在「不带签名仍返回 code=9074」时才需要，用 reqable 重新抓取后填入。
+          # 注意：签名会过期需定期更新；若长期依赖说明方案脆弱，建议改无头驱动真实客户端。
+          # TRAE_X_HELIOS: ${{ secrets.TRAE_X_HELIOS }}
+          # TRAE_X_MEDUSA: ${{ secrets.TRAE_X_MEDUSA }}
+
           FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
         run: python checkin.py
