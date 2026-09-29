@@ -24,9 +24,11 @@ Trae 每日签到脚本（GitHub Actions 版 · 对齐 traework 客户端请求�
   6. 失败时打印完整 HTTP 状态与原始响应体，便于定位真正的 code。
   7. 保留少量退避重试，应对可能的瞬时错误。
 
-关于 x-helios / x-medusa：这两个是客户端反欺诈 SDK 的动态签名，Python 无法伪造，
-但实测**并非必需** —— 未配置它们时签到照样成功（2026-09-21 GitHub Actions 定时签到验证通过）。
-真正必需的是设备身份三件套：x-device-id / x-market-user-id / vscode-sessionid。
+鉴权实测结论（2026-09-29）：下面两项**至少要有其一**，否则 /claim 返回 code=1001：
+  ① 有效 JWT —— 由 TRAE_SESSION 换取，约 14 天过期，需定期续期；
+  ② 有效的 x-helios + x-medusa 动态签名 —— 客户端 SDK 生成，无法伪造且会过期。
+而设备身份三件套（x-device-id / x-market-user-id / vscode-sessionid）是**始终必需**的，
+缺失或使用派生假值 → code=9074。
 
 原理：
   Trae 网页端 JWT 仅 8h 有效，真实会话凭证是 HttpOnly Cookie
@@ -39,10 +41,10 @@ Trae 每日签到脚本（GitHub Actions 版 · 对齐 traework 客户端请求�
 ★ TRAE_DEVICE_ID        账号 1 的 x-device-id，如 45535852009417
 ★ TRAE_MARKET_USER_ID   账号 1 的 x-market-user-id，如 a15e2e30-80e5-43c5-8aa1-96bba5951415
 ★ TRAE_VSCODE_SESSIONID 账号 1 的 vscode-sessionid，64 位 hex
-  TRAE_SESSION          账号 1 的 X-Cloudide-Session Cookie（选填！）
-                        实测 JWT 对签到并非必需（假 token 也能成功），它现在唯一的价值是
-                        换取合法 JWT 以便用 /status 核实结果。缺失或过期会自动降级为
-                        「无 JWT 模式」，不再导致签到失败。
+★ TRAE_SESSION          账号 1 的 X-Cloudide-Session Cookie（实际必需，约 14 天过期需续）
+                        实测三态：①有效 JWT → 成功；②无效 JWT + 有效 x-helios/x-medusa
+                        签名 → 也成功；③两者皆无 → claim 返回 code=1001 鉴权失败。
+                        签名无法生成且会过期，故常规做法就是定期续这个 Cookie。
   TRAE_DEVICE_BRAND     设备型号（选填，默认 90W2000WCP）
   TRAE_OS_VERSION       系统版本（选填，默认 Windows 11 Home China）
   TRAE_SESSION_N        第 N(N>=2) 个账号会话 Cookie；缺失即停止
@@ -228,7 +230,9 @@ RETRY_KEYWORDS = ["too many", "try again", "频繁", "稍后再试"]
 # 9074 实测结论：HTTP 200 + {"code":9074,"message":"当前参与用户太多，请稍后再试"}，
 # 连续 5 次指数退避重试返回完全相同；非整点定时、非整点手动执行同样必然触发。
 # 即：与时间和并发无关，是请求本身未通过服务端校验。文案「参与用户太多」是障眼法。
-NO_RETRY_CODES = {9074}
+# 1001 实测结论：{"code":1001,"message":"...not able to authenticate you..."}
+# 既无有效 JWT、又无有效 x-helios/x-medusa 签名时的鉴权失败，重试同样无效。
+NO_RETRY_CODES = {9074, 1001}
 
 
 def is_retryable(result) -> bool:
@@ -452,6 +456,11 @@ def main():
                     print("[%s]   成因：设备身份与账号不匹配。请确认 TRAE_DEVICE_ID /" % name)
                     print("[%s]   TRAE_MARKET_USER_ID / TRAE_VSCODE_SESSIONID 是否配成了" % name)
                     print("[%s]   traework 抓包得到的真实值 —— 使用派生假值必然 9074。" % name)
+                elif code == 1001:
+                    print("[%s]   说明：1001 = 鉴权失败，重试无效。" % name)
+                    print("[%s]   需要有【有效 JWT】或【有效 x-helios+x-medusa 签名】之一。" % name)
+                    print("[%s]   对策：重新登录 trae.cn 复制 X-Cloudide-Session，更新" % name)
+                    print("[%s]   TRAE_SESSION 后重试（约 14 天需续一次）。" % name)
                 fail_names.append(name)
                 all_ok = False
         except Exception as e:
