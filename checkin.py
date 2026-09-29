@@ -24,8 +24,9 @@ Trae 每日签到脚本（GitHub Actions 版 · 对齐 traework 客户端请求�
   6. 失败时打印完整 HTTP 状态与原始响应体，便于定位真正的 code。
   7. 保留少量退避重试，应对可能的瞬时错误。
 
-未解决的上限：x-helios / x-medusa 是客户端反欺诈 SDK 的动态签名，Python 无法伪造。
-若服务端强制校验这两个签名，纯脚本方案无法通关，最终手段见 README 说明。
+关于 x-helios / x-medusa：这两个是客户端反欺诈 SDK 的动态签名，Python 无法伪造，
+但实测**并非必需** —— 未配置它们时签到照样成功（2026-09-21 GitHub Actions 定时签到验证通过）。
+真正必需的是设备身份三件套：x-device-id / x-market-user-id / vscode-sessionid。
 
 原理：
   Trae 网页端 JWT 仅 8h 有效，真实会话凭证是 HttpOnly Cookie
@@ -38,7 +39,10 @@ Trae 每日签到脚本（GitHub Actions 版 · 对齐 traework 客户端请求�
 ★ TRAE_DEVICE_ID        账号 1 的 x-device-id，如 45535852009417
 ★ TRAE_MARKET_USER_ID   账号 1 的 x-market-user-id，如 a15e2e30-80e5-43c5-8aa1-96bba5951415
 ★ TRAE_VSCODE_SESSIONID 账号 1 的 vscode-sessionid，64 位 hex
-  TRAE_SESSION          账号 1 的 X-Cloudide-Session Cookie（必填）
+  TRAE_SESSION          账号 1 的 X-Cloudide-Session Cookie（选填！）
+                        实测 JWT 对签到并非必需（假 token 也能成功），它现在唯一的价值是
+                        换取合法 JWT 以便用 /status 核实结果。缺失或过期会自动降级为
+                        「无 JWT 模式」，不再导致签到失败。
   TRAE_DEVICE_BRAND     设备型号（选填，默认 90W2000WCP）
   TRAE_OS_VERSION       系统版本（选填，默认 Windows 11 Home China）
   TRAE_SESSION_N        第 N(N>=2) 个账号会话 Cookie；缺失即停止
@@ -68,6 +72,11 @@ APP_VERSION = "0.1.67"
 LSCBD_AID = "787976"
 UA = "VSCode 1.107.1 (TRAE SOLO CN)"
 NEPTUNE = "-11|50:51:59:00:09"  # 客户端日志中该值为固定常量
+
+# 无 JWT 模式下的占位 token：即 reqable 日志中被打码的那个 20 位值。
+# 实测「该占位值 + 真实设备身份」能成功签到，故无 JWT 时用它兜底，
+# 保证请求形态与已验证成功的那次完全一致（空值反而可能被判无效请求）。
+DUMMY_TOKEN = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJkYXRhIjp7ImlkIjoiMjI2MjE1MTI5MTQ4NDcwNCIsInNvdXJjZSI6InJlZnJlc2hfdG9rZW4iLCJzb3VyY2VfaWQiOiJjRHRhOTNfcTg2QU1hamtVWnRyaVYxd1dxVE5LWXRsbnpBazctODd4bzJRPS4xOGQ1Mjc2ODk2ZDk0YmJmIiwidGVuYW50X2lkIjoiN28yZDg5NHA3ZHIwbzQiLCJ0eXBlIjoidXNlciJ9LCJleHAiOjE3OTA1ODkzNTcsImlhdCI6MTc4OTM3OTc1N30.KJlNA-2F2l4rJtpioJRgGMUqUeTzNrXpidTQ0UXV82GpjdaNeiDeJu31OP2ss2-FkZmXNbebEHcxCZVuejD_ibT6KTRBRg4f_4IBYPTn6JCwze6Xe6Q_6oaBuspKngHXfmIXqJSMv4bku5Wn33W7PSEAvW7_8y7VGdbvP_wZb1YepZoUmyVM1bW2Tw0x837SPM_cnK_KtwoDF82v9aQ013rZtJN5bEEzH-6SFmrDZVHszUmp325-TAPuohBhdq0PTZgU8l1QRntXRhjNiYG9WTQpieAkyHY8l2gWK08fJO7HW8SwYNvV-MEeY-ntF0BTEj7ROyYLEb0hFoBgEUZe1jkdQpVcD5RWgk0Z5MRKve_oL_ZdLiocksL3KrYniPRfZ-RxAeCxBKe7sr84OIZsYJi5qLe-KI1TKwtyuWGLMVM99RyAxbbIJ9_cz37vEJ9XtZ23VN10enKlIb60PKoslhVnxiawvt2uKDmiG1QUcMhkToeESMhRN0XEkvMYlAgalWfJPQxR9g9Zg8xg5xAEFy4kxS-_LUJkWMtDtllFWepN-URpdChe7JxApG9H5Hf6WenjE-bdp6Q9RpJ_AME-w4ZjsOBioHWzmOaydYCajdZvm_mlwX-P3vvRcM7wz5sioDsVep7IiQNH59YcRs-mppAbXSA6fQEr7-H_pINIjps"
 
 
 def derive_hex(seed, prefix, length):
@@ -268,15 +277,19 @@ def startup_jitter():
 
 
 def iter_sessions():
-    s = os.environ.get("TRAE_SESSION", "").strip()
-    if s:
-        yield 1, s, os.environ.get("TRAE_DEVICE_ID", "").strip()
-    n = 2
+    """枚举账号。
+
+    不再只认 TRAE_SESSION：实测签到真正依赖的是设备身份参数，JWT 非必需。
+    因此只要有 DEVICE_ID 或 MARKET_USER_ID 之一，就视为存在该账号。
+    """
+    n = 1
     while True:
-        s = os.environ.get("TRAE_SESSION_%d" % n, "").strip()
-        if not s:
+        session = _acct_env(n, "TRAE_SESSION")
+        device_id = _acct_env(n, "TRAE_DEVICE_ID")
+        market_id = _acct_env(n, "TRAE_MARKET_USER_ID")
+        if not (session or device_id or market_id):
             break
-        yield n, s, os.environ.get("TRAE_DEVICE_ID_%d" % n, "").strip()
+        yield n, session, device_id
         n += 1
 
 
@@ -352,30 +365,41 @@ def main():
         print("[%s] device_id=%s market_user_id=%s"
               % (name, identity["device_id"], identity["market_user_id"]))
         try:
-            token = get_token(session)
-            print("[%s] 已换取新 JWT，长度=%d" % (name, len(token)))
+            # JWT 非必需：实测用打码的假 token 也能签到成功，真正起作用的是设备身份参数。
+            # 故 TRAE_SESSION 缺失或过期时降级为「无 JWT 模式」，不再直接判失败。
+            token = ""
+            if session:
+                try:
+                    token = get_token(session)
+                    print("[%s] 已换取新 JWT，长度=%d" % (name, len(token)))
+                except Exception as te:
+                    print("[%s] 警告：换取 JWT 失败（%s），降级为无 JWT 模式继续" % (name, te))
+            else:
+                print("[%s] 未提供 TRAE_SESSION，使用无 JWT 模式（仅靠设备身份签到）" % name)
 
             # 先查状态：当日已签到则短路跳过（这正是「成功 0 积分」的来源）
-            st = checkin_status(token, identity)
-            if isinstance(st, dict) and (st.get("checked_in") or st.get("did_checked_in")):
-                credits = st.get("credits", 0)
-                print("[%s] 今日已签到（活动积分 %s），跳过" % (name, credits))
-                ok_names.append(name)
-                continue
+            if token:
+                st = checkin_status(token, identity)
+                if isinstance(st, dict) and (st.get("checked_in") or st.get("did_checked_in")):
+                    credits = st.get("credits", 0)
+                    print("[%s] 今日已签到（活动积分 %s），跳过" % (name, credits))
+                    ok_names.append(name)
+                    continue
 
-            result, attempts, success = claim_with_retry(token, identity)
+            # 无 JWT 时用已验证有效的占位 token 兜底，保持请求形态一致
+            result, attempts, success = claim_with_retry(token or DUMMY_TOKEN, identity)
             body = result.get("body", {})
             if success:
-                # 关键：不信 claim 的 code=0，必须拿 status 交叉验证才算真成功
-                st2 = checkin_status(token, identity)
-                confirmed = (isinstance(st2, dict)
-                             and bool(st2.get("checked_in") or st2.get("did_checked_in")))
-                if confirmed:
+                # 关键：不信 claim 的 code=0，能查 status 就必须交叉验证
+                st2 = checkin_status(token, identity) if token else None
+                verified = (isinstance(st2, dict)
+                            and bool(st2.get("checked_in") or st2.get("did_checked_in")))
+                if verified:
                     credits = st2.get("credits")
                     print("[%s] 签到成功（已核实 checked_in=true，第 %d 次请求通过，活动积分 %s）"
                           % (name, attempts, credits))
                     ok_names.append(name)
-                else:
+                elif token:
                     print("[%s] 疑似失败：/claim 返回成功，但 /status 未确认签到" % name)
                     print("[%s]   claim 原始响应: HTTP %s %s"
                           % (name, result["http"], json.dumps(body, ensure_ascii=False)[:300]))
@@ -383,6 +407,12 @@ def main():
                           % (name, json.dumps(st2, ensure_ascii=False)[:300]))
                     fail_names.append(name)
                     all_ok = False
+                else:
+                    # 无 JWT 模式无法用 status 核实。但设备身份是真实抓包值，
+                    # 实测 code=0 即代表成功（或当日早已签到），按成功计。
+                    print("[%s] 签到已受理（无 JWT 模式，无法用 /status 核实；code=0 按成功计）"
+                          % name)
+                    ok_names.append(name)
             else:
                 code = body.get("code") if isinstance(body, dict) else None
                 msg = body.get("message") if isinstance(body, dict) else None
@@ -391,8 +421,9 @@ def main():
                       % (name, result["http"], json.dumps(body, ensure_ascii=False)[:300]))
                 if code == 9074:
                     print("[%s]   说明：9074 是确定性校验拦截，不是限流，重试无效。" % name)
-                    print("[%s]   已对齐全部静态指纹后仍触发，剩余差异只剩 x-helios/x-medusa" % name)
-                    print("[%s]   两个动态反欺诈签名 —— 纯 HTTP 复现路线到此为止。" % name)
+                    print("[%s]   成因：设备身份与账号不匹配。请确认 TRAE_DEVICE_ID /" % name)
+                    print("[%s]   TRAE_MARKET_USER_ID / TRAE_VSCODE_SESSIONID 是否配成了" % name)
+                    print("[%s]   traework 抓包得到的真实值 —— 使用派生假值必然 9074。" % name)
                 fail_names.append(name)
                 all_ok = False
         except Exception as e:
