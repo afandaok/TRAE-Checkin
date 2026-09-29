@@ -97,6 +97,33 @@ def derive_device_id(seed):
     return str(n % 10 ** 14).zfill(14)
 
 
+def _decode(resp, raw):
+    """按 Content-Encoding 解压后再解码。
+
+    背景：曾出现响应体为压缩乱码导致 JSON 解析失败、code=None 的情况——
+    urllib 不会自动解压。本脚本要求纯标准库，只能用 gzip/zlib 处理 gzip/deflate，
+    因此请求头已不再声明 br/zstd，避免拿到无法解压的编码。
+    """
+    enc = ""
+    try:
+        enc = (resp.headers.get("Content-Encoding") or "").lower()
+    except Exception:
+        pass
+    try:
+        if "gzip" in enc:
+            import gzip
+            raw = gzip.decompress(raw)
+        elif "deflate" in enc:
+            import zlib
+            try:
+                raw = zlib.decompress(raw)
+            except zlib.error:
+                raw = zlib.decompress(raw, -zlib.MAX_WBITS)
+    except Exception:
+        pass
+    return raw.decode("utf-8", errors="replace")
+
+
 def _post(path, headers, body=""):
     """POST；非 2xx 不抛异常，以 (status, text) 返回，便于上层判断原因。"""
     import urllib.error
@@ -104,16 +131,17 @@ def _post(path, headers, body=""):
         BASE + path, data=body.encode("utf-8"), headers=headers, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
-            return resp.status, resp.read().decode("utf-8", errors="replace")
+            return resp.status, _decode(resp, resp.read())
     except urllib.error.HTTPError as e:
-        return e.code, e.read().decode("utf-8", errors="replace")
+        return e.code, _decode(e, e.read())
 
 
 def build_client_headers(token, identity):
     """构造与 traework 客户端一致的请求头。identity 含稳定指纹字段。"""
     headers = {
         "host": "api.trae.cn",
-        "accept-encoding": "gzip, deflate, br, zstd",
+        # 不声明 br/zstd：标准库无法解压，会导致响应变成乱码（实测踩过）
+        "accept-encoding": "gzip, deflate",
         "accept-language": "zh-CN",
         "authorization": "Cloud-IDE-JWT " + token,
         "sec-fetch-dest": "empty",
